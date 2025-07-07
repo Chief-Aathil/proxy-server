@@ -1,5 +1,9 @@
 package com.proxy.server.tcp;
 
+import com.proxy.server.http.HttpRequestHandler;
+import com.proxy.server.https.HttpsRequestHandler;
+import com.proxy.server.model.ParsedRequest;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -19,6 +23,17 @@ public class TcpConnectionHandler implements Runnable {
     @Value("${proxy.server.port}")
     private int port;
 
+    private final HttpRequestHandler httpRequestHandler;
+    private final HttpsRequestHandler httpsRequestHandler;
+    private final RequestParser requestParser;
+
+    @Autowired
+    public TcpConnectionHandler(HttpRequestHandler httpHandler, HttpsRequestHandler httpsHandler, RequestParser requestParser) {
+        this.httpRequestHandler = httpHandler;
+        this.httpsRequestHandler = httpsHandler;
+        this.requestParser = requestParser;
+    }
+
     @PostConstruct
     public void init() {
         new Thread(this).start(); // Start server socket in new thread
@@ -35,26 +50,41 @@ public class TcpConnectionHandler implements Runnable {
             BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
             BufferedWriter out = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream()));
 
-            String line;
-            StringBuilder request = new StringBuilder();
-            while ((line = in.readLine()) != null) {
-                if (line.isEmpty()) {
-                    // End of headers — respond with mock data
-                    System.out.println("[proxy-server] Full request:\n" + request);
-
-                    String mockResponse = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
-                    out.write(mockResponse);
-                    out.flush();
-
-                    // Clear request buffer for next one
-                    request.setLength(0);
-                } else {
-                    request.append(line).append("\r\n");
-                }
+            while (!clientSocket.isClosed()) {
+                handleRequest(clientSocket, in, out);
             }
 
         } catch (IOException e) {
             e.printStackTrace();
         }
     }
+
+    private void handleRequest(Socket clientSocket, BufferedReader in, BufferedWriter out) throws IOException {
+        while (!clientSocket.isClosed()) {
+            StringBuilder request = new StringBuilder();
+            String line;
+            while ((line = in.readLine()) != null) {
+                if (line.isEmpty()) break;
+                request.append(line).append("\r\n");
+            }
+
+            if (request.length() == 0) continue;
+
+            try {
+                ParsedRequest parsed = requestParser.parse(request.toString());
+
+                if ("CONNECT".equalsIgnoreCase(parsed.method())) {
+                    httpsRequestHandler.handle(parsed, clientSocket, out);
+                } else {
+                    httpRequestHandler.handle(parsed, clientSocket, out);
+                }
+            } catch (Exception e) {
+                System.err.println("[proxy-server] Error handling request: " + e.getMessage());
+                out.write("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+                out.flush();
+            }
+        }
+    }
+
+
 }
