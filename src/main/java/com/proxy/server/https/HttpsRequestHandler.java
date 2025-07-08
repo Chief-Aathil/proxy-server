@@ -1,10 +1,9 @@
 package com.proxy.server.https;
 
 import com.proxy.server.model.ParsedRequest;
-import com.proxy.server.tcp.RequestHandler;
+import com.proxy.server.model.RequestHandler;
 import org.springframework.stereotype.Component;
 
-import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -18,15 +17,19 @@ public class HttpsRequestHandler  implements RequestHandler {
     }
 
     @Override
-    public void handle(ParsedRequest request, Socket clientSocket, BufferedWriter out) throws IOException {
+    public void handle(ParsedRequest request, Socket clientSocket, OutputStream out) throws IOException {
         String[] hostParts = request.path().split(":");
-        if (hostParts.length != 2) return;
+        if (hostParts.length != 2) {
+            out.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".getBytes());
+            out.flush();
+            return;
+        }
 
         String host = hostParts[0];
         int port = Integer.parseInt(hostParts[1]);
 
         try (Socket targetSocket = new Socket(host, port)) {
-            out.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+            out.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes());
             out.flush();
             forwardStreams(clientSocket, targetSocket);
         } catch (IOException e) {
@@ -40,7 +43,10 @@ public class HttpsRequestHandler  implements RequestHandler {
     }
 
     private void pipe(Socket inSocket, Socket outSocket) {
-        try (InputStream in = inSocket.getInputStream(); OutputStream out = outSocket.getOutputStream()) {
+        try (
+                InputStream in = inSocket.getInputStream();
+                OutputStream out = outSocket.getOutputStream()
+        ) {
             byte[] buffer = new byte[8192];
             int read;
             while ((read = in.read(buffer)) != -1) {
