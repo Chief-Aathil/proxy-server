@@ -1,0 +1,98 @@
+@startuml proxyFlow
+participant Browser
+participant "Proxy-Client (Spring Boot)" as ProxyClientApp
+participant "Proxy-Client: Socket Acceptor Thread" as ClientAcceptor
+participant "Proxy-Client: Client Handler Thread (per client)" as ClientHandler
+participant "Proxy-Client: Request Queue (BlockingQueue)" as RequestQueue
+participant "Proxy-Client: Proxy-Server Connection Manager Thread" as ServerConnMgr
+participant ProxyServer
+participant "Internet (Target Web Server)" as Internet
+
+activate Browser
+activate ProxyClientApp
+
+Browser->>ProxyClientApp: Configured as Proxy: localhost:8080
+ProxyClientApp-->>ClientAcceptor: Starts Socket Acceptor Thread (on 8080)
+ProxyClientApp-->>ServerConnMgr: Starts Proxy-Server Connection Manager Thread
+activate ProxyServer
+
+' Initial Connection from ServerConnMgr to ProxyServer
+ServerConnMgr->>ProxyServer: Establishes Persistent TCP Connection (Port 9000)
+activate ServerConnMgr
+ServerConnMgr-->>ProxyServer: (Waits for requests from Queue)
+ProxyServer-->>ServerConnMgr: (Waits for data from persistent connection)
+
+' Scenario 1: HTTP Request
+Browser->>ClientAcceptor: 1. TCP Connect (for http://example.com)
+activate ClientHandler
+ClientAcceptor->>ClientHandler: Creates Client Handler Thread
+ClientHandler->>Browser: Reads Initial Request Line
+Browser->>ClientHandler: GET http://example.com/ HTTP/1.1 (Full Headers/Body)
+ClientHandler->>ClientHandler: Differentiates HTTP vs. CONNECT
+ClientHandler->>RequestQueue: Adds ProxyRequestTask (Type: HTTP, Raw HTTP Bytes, Client Sockets)
+ClientHandler->>ClientHandler: (Client Handler Thread waits for response)
+deactivate ClientHandler
+
+ServerConnMgr->>RequestQueue: 2. Takes HTTP ProxyRequestTask (blocks until available)
+activate ServerConnMgr
+ServerConnMgr->>ProxyServer: 3. Sends Length-Prefixed HTTP Request Bytes
+activate ProxyServer
+ProxyServer->>Internet: 4. Makes Actual HTTP Request
+activate Internet
+Internet-->>ProxyServer: 5. Returns HTTP Response
+deactivate Internet
+ProxyServer->>ServerConnMgr: 6. Sends Length-Prefixed HTTP Response Bytes
+deactivate ProxyServer
+ServerConnMgr->>ClientHandler: 7. Notifies/Passes Raw HTTP Response Bytes (to original ClientHandler thread)
+activate ClientHandler
+ClientHandler->>Browser: 8. Sends HTTP Response back to Browser
+deactivate ClientHandler
+Browser->>ProxyClientApp: Closes TCP Connection (or Keep-Alive for next request)
+
+' Scenario 2: HTTPS Request (Sequential after HTTP)
+Browser->>ClientAcceptor: 9. TCP Connect (for https://secure.com)
+activate ClientHandler
+ClientAcceptor->>ClientHandler: Creates Client Handler Thread
+ClientHandler->>Browser: Reads Initial Request Line
+Browser->>ClientHandler: CONNECT secure.com:443 HTTP/1.1
+ClientHandler->>ClientHandler: Differentiates HTTP vs. CONNECT
+ClientHandler->>Browser: 10. Sends "HTTP/1.1 200 Connection Established"
+ClientHandler->>RequestQueue: 11. Adds ProxyRequestTask (Type: CONNECT, Target Host:Port, Client Sockets)
+ClientHandler->>ClientHandler: (Client Handler Thread waits for tunnel to complete)
+deactivate ClientHandler
+
+ServerConnMgr->>RequestQueue: 12. Takes CONNECT ProxyRequestTask (blocks until available)
+activate ServerConnMgr
+ServerConnMgr->>ProxyServer: 13. Sends CONNECT Initiation Frame (e.g., Type+Host:Port)
+activate ProxyServer
+ProxyServer->>Internet: 14. Establishes TCP Connection to secure.com:443
+activate Internet
+ProxyServer->>ProxyServer: Spawns Tunnel Copy Threads (ProxyServer-Internet bidirectional)
+
+loop Tunnel Data Transfer (Bidirectional)
+    Browser->>ClientHandler: (Encrypted) Data (e.g., TLS Handshake)
+    ClientHandler->>ServerConnMgr: Encapsulates into Data Frame (e.g., Type+Length+Bytes)
+    ServerConnMgr->>ProxyServer: Sends Data Frame over Persistent Connection
+    ProxyServer->>Internet: Forwards Raw Encrypted Data
+    Internet-->>ProxyServer: Sends Raw Encrypted Data
+    ProxyServer-->>ServerConnMgr: Encapsulates into Data Frame (e.g., Type+Length+Bytes)
+    ServerConnMgr-->>ClientHandler: Forwards Raw Encrypted Data
+    ClientHandler-->>Browser: Sends Raw Encrypted Data
+end
+
+Browser->>ClientHandler: Closes TCP Connection (End of Tunnel)
+ClientHandler->>ServerConnMgr: Sends Tunnel Close Signal/Notifies Completion
+ServerConnMgr->>ProxyServer: Sends Tunnel Close Signal (e.g., Type+EOF)
+ProxyServer->>Internet: Closes TCP Connection to secure.com:443
+deactivate Internet
+deactivate ProxyServer
+deactivate ServerConnMgr
+deactivate ClientHandler
+
+ServerConnMgr->>ServerConnMgr: Ready for next request from RequestQueue
+deactivate ServerConnMgr
+ProxyServer-->>ProxyServer: Ready for next request from Persistent Connection
+
+deactivate ProxyClientApp
+deactivate Browser
+@enduml
