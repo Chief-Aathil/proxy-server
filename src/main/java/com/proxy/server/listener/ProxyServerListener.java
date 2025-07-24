@@ -15,9 +15,9 @@ import java.nio.charset.StandardCharsets;
 @Service
 public class ProxyServerListener {
 
-    public static final int READ_TIMEOUT = 5000;
+    public static final int READ_TIMEOUT = 30000;
     public static final int PORT_FOR_PROXY_CLIENT = 9000;
-    private final int PROXY_CLIENT_CONNECTION_TIMEOUT = 1000;
+    private final int PROXY_CLIENT_CONNECTION_TIMEOUT = 7000;
     private ServerSocket serverSocket;
     private volatile boolean running = true;
     private Socket proxyClientConnection = null;
@@ -47,6 +47,7 @@ public class ProxyServerListener {
 
                 } catch (SocketTimeoutException e) {
                     // Expected during graceful shutdown, or if no client connects for a while
+                    System.out.println("Timed out for Proxy-Client connection setup");
                 } catch (IOException e) {
                     if (running) {
                         System.err.println("Proxy-Server Listener error accepting connection: " + e.getMessage());
