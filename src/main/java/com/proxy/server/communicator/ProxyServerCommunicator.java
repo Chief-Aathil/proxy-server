@@ -1,7 +1,10 @@
 package com.proxy.server.communicator;
 
 import com.proxy.server.communicator.FramedMessage; // Import FramedMessage from client package
+import com.proxy.server.processor.HttpProcessor;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PreDestroy;
@@ -11,6 +14,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 
 @Component
 @Slf4j
+@RequiredArgsConstructor
 public class ProxyServerCommunicator {
 
     // Queue for outgoing FramedMessages to be sent by the send thread
@@ -28,7 +33,7 @@ public class ProxyServerCommunicator {
     private DataOutputStream dataOutputStream;
     private ExecutorService executorService;
     private volatile boolean running = false;
-
+    private final HttpProcessor httpProcessor;
     /**
      * Initializes the communicator with the input and output streams of the client tunnel socket.
      * This method must be called after a successful socket connection is accepted.
@@ -148,12 +153,22 @@ public class ProxyServerCommunicator {
         switch (message.getMessageType()) {
             case HEARTBEAT_PING:
                 log.info("Received HEARTBEAT_PING from client: {}. Sending PONG.", message.getRequestID());
-                // Send a PONG response with the same request ID
                 send(new FramedMessage(FramedMessage.MessageType.HEARTBEAT_PONG, message.getRequestID(), new byte[0]));
                 break;
-            case HEARTBEAT_PONG:
-                log.warn("Received unexpected HEARTBEAT_PONG from client: {}. (Server should not receive PONGs unless it sent a PING, which it doesn't in this phase).", message.getRequestID());
+            case HTTP_REQUEST:
+                log.info("Received HTTP_REQUEST from client: {}. Dispatching to HttpProcessor.", message.getRequestID());
+                httpProcessor.processHttpRequest(message); // Dispatch to HttpProcessor
                 break;
+            case HTTPS_CONNECT:
+                // TODO: In Phase 3, dispatch to HttpsProcessor
+                log.warn("Received HTTPS_CONNECT from client: {}. HttpsProcessor not yet implemented.", message.getRequestID());
+                send(new FramedMessage(FramedMessage.MessageType.CONTROL_500_ERROR, message.getRequestID(), "HTTPS Not Supported Yet".getBytes(StandardCharsets.UTF_8)));
+                break;
+            case HEARTBEAT_PONG: // Server should not receive PONG unless it sent a PING, which it doesn't in this phase.
+            case HTTP_RESPONSE:  // Server should only send HTTP_RESPONSE, not receive it (unless it's a very specific reverse proxy scenario, not here)
+            case HTTPS_DATA:     // Handled by HttpsProcessor in Phase 3
+            case CONTROL_200_OK: // Control messages are for internal tunnel management, not direct data.
+            case CONTROL_TUNNEL_CLOSE: // Control messages
             default:
                 log.warn("Received unhandled message type: {} with ID: {}", message.getMessageType(), message.getRequestID());
                 // In later phases, this will dispatch to HttpProcessor/HttpsProcessor
