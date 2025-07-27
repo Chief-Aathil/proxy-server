@@ -20,6 +20,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 
 @Component
 @Slf4j
@@ -128,9 +129,6 @@ public class ProxyServerCommunicator {
                      DataInputStream dis = new DataInputStream(bis)) {
                     FramedMessage receivedMessage = FramedMessage.fromStream(dis);
                     log.debug("Received message: {}", receivedMessage);
-
-                    // For Phase 1, we'll handle PING/PONG directly here.
-                    // In later phases, this will involve dispatching to HttpProcessor/HttpsProcessor.
                     handleReceivedMessage(receivedMessage);
                 }
             } catch (IOException e) {
@@ -157,7 +155,8 @@ public class ProxyServerCommunicator {
                 break;
             case HTTP_REQUEST:
                 log.info("Received HTTP_REQUEST from client: {}. Dispatching to HttpProcessor.", message.getRequestID());
-                httpProcessor.processHttpRequest(message); // Dispatch to HttpProcessor
+                httpProcessor.processHttpRequest(message)
+                        .whenComplete(sendResponseToClient(message));
                 break;
             case HTTPS_CONNECT:
                 // TODO: In Phase 3, dispatch to HttpsProcessor
@@ -174,6 +173,29 @@ public class ProxyServerCommunicator {
                 // In later phases, this will dispatch to HttpProcessor/HttpsProcessor
                 break;
         }
+    }
+
+    private BiConsumer<FramedMessage, Throwable> sendResponseToClient(FramedMessage message) {
+        return (responseFramedMessage, ex) -> {
+            if (ex != null) {
+                log.error("Error from HttpProcessor for ID {}: {}", message.getRequestID(), ex.getMessage());
+                try {
+                    // Send a generic 500 error if HttpProcessor completes exceptionally
+                    send(new FramedMessage(FramedMessage.MessageType.CONTROL_500_ERROR, message.getRequestID(),
+                            ("Server processing error: " + ex.getMessage()).getBytes(StandardCharsets.UTF_8)));
+                } catch (InterruptedException sendEx) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Interrupted while sending error response for ID {}: {}", message.getRequestID(), sendEx.getMessage());
+                }
+            } else {
+                try {
+                    send(responseFramedMessage);
+                } catch (InterruptedException sendEx) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Interrupted while sending HTTP response for ID {}: {}", message.getRequestID(), sendEx.getMessage());
+                }
+            }
+        };
     }
 
     /**

@@ -7,6 +7,7 @@ import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
+
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -151,13 +152,13 @@ public class HttpProcessor {
                     transferEncoding = headerValue;
                 }
                 // Exclude headers that proxies typically manage or remove
-                if (!headerName.equalsIgnoreCase("Proxy-Connection") &&
-                    !headerName.equalsIgnoreCase("Connection") &&
-                    !headerName.equalsIgnoreCase("Keep-Alive") &&
-                    !headerName.equalsIgnoreCase("Proxy-Authorization") &&
-                    !headerName.equalsIgnoreCase("TE") &&
-                    !headerName.equalsIgnoreCase("Upgrade"))
-                {
+                if (!headerName.equalsIgnoreCase("Host") &&
+                        !headerName.equalsIgnoreCase("Proxy-Connection") &&
+                        !headerName.equalsIgnoreCase("Connection") &&
+                        !headerName.equalsIgnoreCase("Keep-Alive") &&
+                        !headerName.equalsIgnoreCase("Proxy-Authorization") &&
+                        !headerName.equalsIgnoreCase("TE") &&
+                        !headerName.equalsIgnoreCase("Upgrade")) {
                     requestBuilder.header(headerName, headerValue);
                 }
             } else {
@@ -217,8 +218,9 @@ public class HttpProcessor {
 
         // Headers
         httpResponse.headers().map().forEach((name, values) -> {
-            if (!name.equalsIgnoreCase("Transfer-Encoding") && !name.equalsIgnoreCase("Content-Encoding") &&
-                !name.equalsIgnoreCase("Connection") && !name.equalsIgnoreCase("Keep-Alive")) {
+            if (!name.equalsIgnoreCase("Transfer-Encoding") &&
+                !name.equalsIgnoreCase("Connection") &&
+                !name.equalsIgnoreCase("Keep-Alive")) {
                 values.forEach(value -> {
                     try {
                         bos.write((name + ": " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
