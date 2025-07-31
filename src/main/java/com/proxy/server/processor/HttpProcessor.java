@@ -59,7 +59,7 @@ public class HttpProcessor {
     public CompletableFuture<FramedMessage> processHttpRequest(FramedMessage httpRequest) {
         UUID requestID = httpRequest.getRequestID();
         byte[] rawRequestPayload = httpRequest.getPayload();
-        log.debug("HttpProcessor received HTTP_REQUEST for ID: {}", requestID);
+        log.info("HttpProcessor received HTTP_REQUEST for ID: {}", requestID);
 
         try {
             // 1. Parse the raw HTTP request bytes
@@ -220,7 +220,8 @@ public class HttpProcessor {
         httpResponse.headers().map().forEach((name, values) -> {
             if (!name.equalsIgnoreCase("Transfer-Encoding") &&
                 !name.equalsIgnoreCase("Connection") &&
-                !name.equalsIgnoreCase("Keep-Alive")) {
+                !name.equalsIgnoreCase("Keep-Alive") &&
+                !name.equalsIgnoreCase("Content-Length")) {  
                 values.forEach(value -> {
                     try {
                         bos.write((name + ": " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
@@ -231,7 +232,6 @@ public class HttpProcessor {
             }
         });
 
-        // Content-Length header (if body exists)
         byte[] body = httpResponse.body();
         if (body != null && body.length > 0) {
             bos.write(("Content-Length: " + body.length + "\r\n").getBytes(StandardCharsets.ISO_8859_1));

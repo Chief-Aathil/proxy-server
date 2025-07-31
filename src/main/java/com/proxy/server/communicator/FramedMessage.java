@@ -27,7 +27,7 @@ public class FramedMessage {
         HTTPS_DATA((byte) 4),
         CONTROL_200_OK((byte) 5),
         CONTROL_TUNNEL_CLOSE((byte) 6),
-        CONTROL_500_ERROR((byte) 0x32),
+        CONTROL_500_ERROR((byte) 50),
         HEARTBEAT_PING((byte) 7),
         HEARTBEAT_PONG((byte) 8),
         UNKNOWN((byte) 0);
