@@ -1,10 +1,11 @@
 package com.proxy.server.communicator;
 
-import com.proxy.server.communicator.FramedMessage; // Import FramedMessage from client package
 import com.proxy.server.processor.HttpProcessor;
+import com.proxy.server.processor.HttpsProcessor;
 import lombok.RequiredArgsConstructor;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.annotation.Lazy;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PreDestroy;
@@ -14,13 +15,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
-import java.util.function.BiConsumer;
+import java.util.UUID;
+import java.util.concurrent.*;
 
 @Component
 @Slf4j
@@ -29,12 +25,19 @@ public class ProxyServerCommunicator {
 
     // Queue for outgoing FramedMessages to be sent by the send thread
     private final BlockingQueue<FramedMessage> outgoingQueue = new LinkedBlockingQueue<>();
+    // Map to correlate request IDs with CompletableFutures for responses (for HTTP requests)
+    private final ConcurrentHashMap<UUID, CompletableFuture<FramedMessage>> correlationMap = new ConcurrentHashMap<>();
+    // Map to store active HttpsProcessor instances, one per active HTTPS tunnel (requestID)
+    private final ConcurrentHashMap<UUID, HttpsProcessor> activeHttpsProcessors = new ConcurrentHashMap<>();
 
     private DataInputStream dataInputStream;
     private DataOutputStream dataOutputStream;
     private ExecutorService executorService;
     private volatile boolean running = false;
     private final HttpProcessor httpProcessor;
+    private final ObjectProvider<HttpsProcessor> httpsProcessorProvider;
+
+
     /**
      * Initializes the communicator with the input and output streams of the client tunnel socket.
      * This method must be called after a successful socket connection is accepted.
@@ -66,9 +69,6 @@ public class ProxyServerCommunicator {
     /**
      * Adds a FramedMessage to the outgoing queue for sending.
      * This method is non-blocking.
-     *
-     * @param message The FramedMessage to send.
-     * @throws InterruptedException If the thread is interrupted while adding to the queue.
      */
     public void send(FramedMessage message) throws InterruptedException {
         if (!running) {
@@ -77,6 +77,22 @@ public class ProxyServerCommunicator {
         }
         outgoingQueue.put(message); // Blocking put if queue is full (unlikely for LinkedBlockingQueue)
         log.debug("Added message to outgoing queue: {}", message);
+    }
+
+    /**
+     * Sends a FramedMessage and returns a CompletableFuture that will be completed
+     * when a response with the matching requestID is received.
+     * This is primarily for HTTP responses.
+     *
+     * @param requestMessage The FramedMessage to send.
+     * @return A CompletableFuture that will hold the response FramedMessage.
+     * @throws InterruptedException If the thread is interrupted while sending the message.
+     */
+    public CompletableFuture<FramedMessage> sendAndAwaitResponse(FramedMessage requestMessage) throws InterruptedException {
+        CompletableFuture<FramedMessage> future = new CompletableFuture<>();
+        correlationMap.put(requestMessage.getRequestID(), future);
+        send(requestMessage);
+        return future;
     }
 
     /**
@@ -129,7 +145,7 @@ public class ProxyServerCommunicator {
                      DataInputStream dis = new DataInputStream(bis)) {
                     FramedMessage receivedMessage = FramedMessage.fromStream(dis);
                     log.debug("Received message: {}", receivedMessage);
-                    handleReceivedMessage(receivedMessage);
+                    dispatchReceivedMessage(receivedMessage);
                 }
             } catch (IOException e) {
                 log.error("Error receiving message: {}. Client tunnel likely lost. Shutting down receive loop.", e.getMessage());
@@ -143,59 +159,92 @@ public class ProxyServerCommunicator {
     }
 
     /**
-     * Handles a received FramedMessage. For Phase 1, this includes basic PING/PONG.
-     * In later phases, this will dispatch to appropriate processors.
+     * Dispatches received FramedMessages to the appropriate processor or CompletableFuture.
+     * This is the central routing logic for all incoming messages from the client.
+     *
      * @param message The received FramedMessage.
      */
-    private void handleReceivedMessage(FramedMessage message) throws InterruptedException {
+    private void dispatchReceivedMessage(FramedMessage message) {
+        // First, check if there's a CompletableFuture waiting for this message (e.g., HTTP response)
+        CompletableFuture<FramedMessage> future = correlationMap.remove(message.getRequestID());
+        if (future != null) {
+            future.complete(message);
+            log.debug("Completed pending future for ID: {} (Type: {})", message.getRequestID(), message.getMessageType());
+            return; // Message handled by a waiting future
+        }
+
+        // If no waiting future, dispatch based on message type
         switch (message.getMessageType()) {
-            case HEARTBEAT_PING:
-                log.info("Received HEARTBEAT_PING from client: {}. Sending PONG.", message.getRequestID());
-                send(new FramedMessage(FramedMessage.MessageType.HEARTBEAT_PONG, message.getRequestID(), new byte[0]));
-                break;
-            case HTTP_REQUEST:
-                log.info("Received HTTP_REQUEST from client: {}. Dispatching to HttpProcessor.", message.getRequestID());
-                httpProcessor.processHttpRequest(message)
-                        .whenComplete(sendResponseToClient(message));
-                break;
-            case HTTPS_CONNECT:
-                // TODO: In Phase 3, dispatch to HttpsProcessor
-                log.warn("Received HTTPS_CONNECT from client: {}. HttpsProcessor not yet implemented.", message.getRequestID());
-                send(new FramedMessage(FramedMessage.MessageType.CONTROL_500_ERROR, message.getRequestID(), "HTTPS Not Supported Yet".getBytes(StandardCharsets.UTF_8)));
-                break;
-            case HEARTBEAT_PONG: // Server should not receive PONG unless it sent a PING, which it doesn't in this phase.
-            case HTTP_RESPONSE:  // Server should only send HTTP_RESPONSE, not receive it (unless it's a very specific reverse proxy scenario, not here)
-            case HTTPS_DATA:     // Handled by HttpsProcessor in Phase 3
-            case CONTROL_200_OK: // Control messages are for internal tunnel management, not direct data.
-            case CONTROL_TUNNEL_CLOSE: // Control messages
-            default:
-                log.warn("Received unhandled message type: {} with ID: {}", message.getMessageType(), message.getRequestID());
-                // In later phases, this will dispatch to HttpProcessor/HttpsProcessor
-                break;
+            case HTTP_REQUEST -> handleHttpRequest(message);
+            case HTTPS_CONNECT -> handleConnect(message);
+            case HTTPS_DATA -> delegateToHttpsProcessor(message);
+            case CONTROL_TUNNEL_CLOSE -> closeTunnel(message);
+            case HEARTBEAT_PING -> sendPong(message);
+            case HEARTBEAT_PONG ->
+                // Client's response to our ping, no action needed here as it's handled by correlationMap (if we ping)
+                    log.debug("Received HEARTBEAT_PONG for ID: {}", message.getRequestID());
+            default ->
+                    log.warn("Received unhandled message type: {} with ID: {}. Discarding.", message.getMessageType(), message.getRequestID());
         }
     }
 
-    private BiConsumer<FramedMessage, Throwable> sendResponseToClient(FramedMessage message) {
-        return (responseFramedMessage, ex) -> {
-            if (ex != null) {
-                log.error("Error from HttpProcessor for ID {}: {}", message.getRequestID(), ex.getMessage());
-                try {
-                    // Send a generic 500 error if HttpProcessor completes exceptionally
-                    send(new FramedMessage(FramedMessage.MessageType.CONTROL_500_ERROR, message.getRequestID(),
-                            ("Server processing error: " + ex.getMessage()).getBytes(StandardCharsets.UTF_8)));
-                } catch (InterruptedException sendEx) {
-                    Thread.currentThread().interrupt();
-                    log.warn("Interrupted while sending error response for ID {}: {}", message.getRequestID(), sendEx.getMessage());
-                }
-            } else {
-                try {
-                    send(responseFramedMessage);
-                } catch (InterruptedException sendEx) {
-                    Thread.currentThread().interrupt();
-                    log.warn("Interrupted while sending HTTP response for ID {}: {}", message.getRequestID(), sendEx.getMessage());
-                }
+    private void handleHttpRequest(FramedMessage message) {
+        httpProcessor.processHttpRequest(message)
+                .thenAccept(response -> {
+                    try {
+                        send(response);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        log.error("Thread interrupted while sending HTTP response: {}", e.getMessage());
+                    }
+                })
+                .exceptionally(ex -> {
+                    log.error("Error processing HTTP request: {}", ex.getMessage(), ex);
+                    return null;
+                });
+    }
+
+    private void handleConnect(FramedMessage message) {
+        HttpsProcessor newHttpsProcessor = httpsProcessorProvider.getObject();
+        activeHttpsProcessors.put(message.getRequestID(), newHttpsProcessor);
+        newHttpsProcessor.handleConnectRequest(message.getRequestID(), message.getPayload());
+    }
+
+    private void delegateToHttpsProcessor(FramedMessage message) {
+        HttpsProcessor httpsProcessor = activeHttpsProcessors.get(message.getRequestID());
+        if (httpsProcessor != null) {
+            httpsProcessor.handleHttpsData(message.getRequestID(), message.getPayload());
+        } else {
+            log.warn("Received HTTPS_DATA for unknown or already closed tunnel ID: {}. Discarding.", message.getRequestID());
+            // Optionally send CONTROL_TUNNEL_CLOSE back if this indicates a desynchronized state
+            try {
+                send(new FramedMessage(FramedMessage.MessageType.CONTROL_TUNNEL_CLOSE, message.getRequestID(), new byte[0]));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Failed to send tunnel close for unknown HTTPS_DATA: {}", e.getMessage());
             }
-        };
+        }
+    }
+
+    private void closeTunnel(FramedMessage message) {
+        // Client initiated a tunnel close. Find the corresponding HttpsProcessor and clean up.
+        HttpsProcessor httpsProcessor = activeHttpsProcessors.remove(message.getRequestID());
+        if (httpsProcessor != null) {
+            httpsProcessor.handleTunnelClose(message.getRequestID());
+            // The HttpsProcessor's shutdown method will handle its internal cleanup
+        } else {
+            log.warn("Received CONTROL_TUNNEL_CLOSE for unknown or already closed tunnel ID: {}. Discarding.", message.getRequestID());
+        }
+    }
+
+    private void sendPong(FramedMessage message) {
+        try {
+            send(new FramedMessage(FramedMessage.MessageType.HEARTBEAT_PONG, message.getRequestID(), new byte[0]));
+            log.info("Responded to HEARTBEAT_PING for ID: {}", message.getRequestID());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Failed to send HEARTBEAT_PONG for ID {}: {}", message.getRequestID(), e.getMessage());
+        }
     }
 
     /**
@@ -218,6 +267,15 @@ public class ProxyServerCommunicator {
             }
         }
 
+        // Clear any pending futures and active HTTPS processors
+        correlationMap.forEach((uuid, future) -> future.cancel(true));
+        correlationMap.clear();
+
+        // Trigger shutdown on all active HttpsProcessor instances
+        activeHttpsProcessors.forEach((id, processor) -> {
+            processor.shutdown();
+        });
+        activeHttpsProcessors.clear();
         outgoingQueue.clear();
 
         try {
