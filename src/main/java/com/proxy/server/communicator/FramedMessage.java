@@ -15,7 +15,7 @@ import java.util.UUID;
 @Getter
 @RequiredArgsConstructor
 @EqualsAndHashCode
-@ToString
+@ToString(exclude = "payload")
 public class FramedMessage {
 
     @Getter
