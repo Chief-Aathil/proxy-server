@@ -2,19 +2,18 @@ package com.proxy.server.communicator;
 
 import com.proxy.server.processor.HttpProcessor;
 import com.proxy.server.processor.HttpsProcessor;
+import jakarta.annotation.PreDestroy;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
-import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
-import jakarta.annotation.PreDestroy;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.net.Socket;
 import java.util.UUID;
 import java.util.concurrent.*;
 
@@ -28,27 +27,29 @@ public class ProxyServerCommunicator {
     // Map to correlate request IDs with CompletableFutures for responses (for HTTP requests)
     private final ConcurrentHashMap<UUID, CompletableFuture<FramedMessage>> correlationMap = new ConcurrentHashMap<>();
     // Map to store active HttpsProcessor instances, one per active HTTPS tunnel (requestID)
-    private final ConcurrentHashMap<UUID, HttpsProcessor> activeHttpsProcessors = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, HttpsProcessor> activeHttpsProcessorsMap = new ConcurrentHashMap<>();
+    private final HttpProcessor httpProcessor;
+    private final ObjectProvider<HttpsProcessor> httpsProcessorProvider;
 
     private DataInputStream dataInputStream;
     private DataOutputStream dataOutputStream;
     private ExecutorService executorService;
+    @Getter
     private volatile boolean running = false;
-    private final HttpProcessor httpProcessor;
-    private final ObjectProvider<HttpsProcessor> httpsProcessorProvider;
-
+    private Runnable connectionLossCallback;
 
     /**
-     * Initializes the communicator with the input and output streams of the client tunnel socket.
+     * Initializes the communicator with the client tunnel socket and a callback for connection loss.
      * This method must be called after a successful socket connection is accepted.
      *
-     * @param inputStream  The InputStream from the accepted client tunnel socket.
-     * @param outputStream The OutputStream from the accepted client tunnel socket.
+     * @param clientTunnelSocket The accepted client tunnel socket.
+     * @param connectionLossCallback A callback to be invoked if the connection is lost.
      */
-    public void initialize(InputStream inputStream, OutputStream outputStream) {
-        this.dataInputStream = new DataInputStream(inputStream);
-        this.dataOutputStream = new DataOutputStream(outputStream);
+    public void initialize(Socket clientTunnelSocket, Runnable connectionLossCallback) throws IOException {
+        this.dataInputStream = new DataInputStream(clientTunnelSocket.getInputStream());
+        this.dataOutputStream = new DataOutputStream(clientTunnelSocket.getOutputStream());
         this.executorService = Executors.newFixedThreadPool(2); // One for sending, one for receiving
+        this.connectionLossCallback = connectionLossCallback;
         log.info("ProxyServerCommunicator initialized with client tunnel streams.");
     }
 
@@ -69,13 +70,15 @@ public class ProxyServerCommunicator {
     /**
      * Adds a FramedMessage to the outgoing queue for sending.
      * This method is non-blocking.
+     *
+     * @throws IOException If the communicator is not running (connection lost).
      */
-    public void send(FramedMessage message) throws InterruptedException {
+    public void send(FramedMessage message) throws InterruptedException, IOException {
         if (!running) {
             log.warn("Communicator is not running. Message not sent: {}", message);
-            return;
+            throw new IOException("Communicator not running, connection likely lost.");
         }
-        outgoingQueue.put(message); // Blocking put if queue is full (unlikely for LinkedBlockingQueue)
+        outgoingQueue.put(message); // Blocking if queue is full
         log.debug("Added message to outgoing queue: {}", message);
     }
 
@@ -84,14 +87,19 @@ public class ProxyServerCommunicator {
      * when a response with the matching requestID is received.
      * This is primarily for HTTP responses.
      *
-     * @param requestMessage The FramedMessage to send.
-     * @return A CompletableFuture that will hold the response FramedMessage.
      * @throws InterruptedException If the thread is interrupted while sending the message.
+     * @throws IOException If the communicator is not running.
      */
-    public CompletableFuture<FramedMessage> sendAndAwaitResponse(FramedMessage requestMessage) throws InterruptedException {
+    public CompletableFuture<FramedMessage> sendAndAwaitResponse(FramedMessage requestMessage) throws InterruptedException, IOException { // Added IOException
         CompletableFuture<FramedMessage> future = new CompletableFuture<>();
         correlationMap.put(requestMessage.getRequestID(), future);
-        send(requestMessage);
+        try {
+            send(requestMessage);
+        } catch (IOException e) {
+            correlationMap.remove(requestMessage.getRequestID());
+            future.completeExceptionally(e); // Propagate send failure to future
+            throw e; // Re-throw for immediate caller handling
+        }
         return future;
     }
 
@@ -115,10 +123,11 @@ public class ProxyServerCommunicator {
                 running = false;
             } catch (IOException e) {
                 log.error("Error sending message: {}. Client tunnel likely lost. Shutting down send loop.", e.getMessage());
+                handleConnectionLoss(); // Notify connection manager
                 running = false; // Signal to stop loops
-                // TODO: In Phase 4, notify ProxyServerConnectionManager about connection loss
             } catch (Exception e) {
                 log.error("Unexpected error in server send loop: {}", e.getMessage(), e);
+                handleConnectionLoss(); // Notify connection manager
             }
         }
         log.info("Server send loop stopped.");
@@ -135,6 +144,7 @@ public class ProxyServerCommunicator {
                 int frameLength = dataInputStream.readInt();
                 if (frameLength < 0) {
                     log.error("Received invalid frame length: {}. Client tunnel likely corrupted. Shutting down receive loop.", frameLength);
+                    handleConnectionLoss(); // Notify connection manager
                     running = false;
                     break;
                 }
@@ -149,10 +159,11 @@ public class ProxyServerCommunicator {
                 }
             } catch (IOException e) {
                 log.error("Error receiving message: {}. Client tunnel likely lost. Shutting down receive loop.", e.getMessage());
+                handleConnectionLoss(); // Notify connection manager
                 running = false; // Signal to stop loops
-                // TODO: In Phase 4, notify ProxyServerConnectionManager about connection loss
             } catch (Exception e) {
                 log.error("Unexpected error in server receive loop: {}", e.getMessage(), e);
+                handleConnectionLoss(); // Notify connection manager
             }
         }
         log.info("Server receive loop stopped.");
@@ -165,7 +176,7 @@ public class ProxyServerCommunicator {
      * @param message The received FramedMessage.
      */
     private void dispatchReceivedMessage(FramedMessage message) {
-        // First, check if there's a CompletableFuture waiting for this message (e.g., HTTP response)
+        // First, check if there's a CompletableFuture waiting for this message (eg:HTTP response)
         CompletableFuture<FramedMessage> future = correlationMap.remove(message.getRequestID());
         if (future != null) {
             future.complete(message);
@@ -180,9 +191,6 @@ public class ProxyServerCommunicator {
             case HTTPS_DATA -> delegateToHttpsProcessor(message);
             case CONTROL_TUNNEL_CLOSE -> closeTunnel(message);
             case HEARTBEAT_PING -> sendPong(message);
-            case HEARTBEAT_PONG ->
-                // Client's response to our ping, no action needed here as it's handled by correlationMap (if we ping)
-                    log.debug("Received HEARTBEAT_PONG for ID: {}", message.getRequestID());
             default ->
                     log.warn("Received unhandled message type: {} with ID: {}. Discarding.", message.getMessageType(), message.getRequestID());
         }
@@ -196,6 +204,8 @@ public class ProxyServerCommunicator {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         log.error("Thread interrupted while sending HTTP response: {}", e.getMessage());
+                    } catch (IOException e) {
+                        log.error("IO error while sending HTTP response: {}", e.getMessage());
                     }
                 })
                 .exceptionally(ex -> {
@@ -206,32 +216,33 @@ public class ProxyServerCommunicator {
 
     private void handleConnect(FramedMessage message) {
         HttpsProcessor newHttpsProcessor = httpsProcessorProvider.getObject();
-        activeHttpsProcessors.put(message.getRequestID(), newHttpsProcessor);
+        activeHttpsProcessorsMap.put(message.getRequestID(), newHttpsProcessor);
         newHttpsProcessor.handleConnectRequest(message.getRequestID(), message.getPayload());
     }
 
     private void delegateToHttpsProcessor(FramedMessage message) {
-        HttpsProcessor httpsProcessor = activeHttpsProcessors.get(message.getRequestID());
+        HttpsProcessor httpsProcessor = activeHttpsProcessorsMap.get(message.getRequestID());
         if (httpsProcessor != null) {
             httpsProcessor.handleHttpsData(message.getRequestID(), message.getPayload());
         } else {
             log.warn("Received HTTPS_DATA for unknown or already closed tunnel ID: {}. Discarding.", message.getRequestID());
-            // Optionally send CONTROL_TUNNEL_CLOSE back if this indicates a desynchronized state
             try {
                 send(new FramedMessage(FramedMessage.MessageType.CONTROL_TUNNEL_CLOSE, message.getRequestID(), new byte[0]));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                log.error("Failed to send tunnel close for unknown HTTPS_DATA: {}", e.getMessage());
+                log.error("Failed to send tunnel close for unknown HTTPS_DATA (interrupted): {}", e.getMessage());
+            } catch (IOException e) {
+                log.error("Failed to send tunnel close for unknown HTTPS_DATA (IO error): {}", e.getMessage());
             }
         }
     }
 
     private void closeTunnel(FramedMessage message) {
         // Client initiated a tunnel close. Find the corresponding HttpsProcessor and clean up.
-        HttpsProcessor httpsProcessor = activeHttpsProcessors.remove(message.getRequestID());
+        HttpsProcessor httpsProcessor = activeHttpsProcessorsMap.remove(message.getRequestID());
         if (httpsProcessor != null) {
-            httpsProcessor.handleTunnelClose(message.getRequestID());
             // The HttpsProcessor's shutdown method will handle its internal cleanup
+            httpsProcessor.handleTunnelClose(message.getRequestID());
         } else {
             log.warn("Received CONTROL_TUNNEL_CLOSE for unknown or already closed tunnel ID: {}. Discarding.", message.getRequestID());
         }
@@ -243,8 +254,38 @@ public class ProxyServerCommunicator {
             log.info("Responded to HEARTBEAT_PING for ID: {}", message.getRequestID());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            log.error("Failed to send HEARTBEAT_PONG for ID {}: {}", message.getRequestID(), e.getMessage());
+            log.error("Failed to send HEARTBEAT_PONG for ID {} (interrupted): {}", message.getRequestID(), e.getMessage());
+        } catch (IOException e) {
+            log.error("Failed to send HEARTBEAT_PONG for ID {} (IO error): {}", message.getRequestID(), e.getMessage());
         }
+    }
+
+    /**
+     * Handles connection loss by calling the registered callback and failing all pending futures.
+     */
+    private void handleConnectionLoss() {
+        // Prevent multiple loss notifications if already shutting down
+        if (!running) {
+            return;
+        }
+        running = false; // Mark as not running immediately
+        log.error("ProxyServerCommunicator: Connection to client lost. Notifying manager and failing pending operations.");
+        if (connectionLossCallback != null) {
+            connectionLossCallback.run();
+        }
+
+        // Fail all pending CompletableFutures for HTTP requests
+        correlationMap.forEach((requestID, future) -> {
+            future.completeExceptionally(new IOException("Connection to client lost."));
+            log.warn("Failing HTTP request future {} due to connection loss.", requestID);
+        });
+        correlationMap.clear();
+
+        // Trigger shutdown on all active HttpsProcessor instances
+        activeHttpsProcessorsMap.forEach((id, processor) -> {
+            processor.shutdown();
+        });
+        activeHttpsProcessorsMap.clear();
     }
 
     /**
@@ -272,10 +313,10 @@ public class ProxyServerCommunicator {
         correlationMap.clear();
 
         // Trigger shutdown on all active HttpsProcessor instances
-        activeHttpsProcessors.forEach((id, processor) -> {
+        activeHttpsProcessorsMap.forEach((id, processor) -> {
             processor.shutdown();
         });
-        activeHttpsProcessors.clear();
+        activeHttpsProcessorsMap.clear();
         outgoingQueue.clear();
 
         try {

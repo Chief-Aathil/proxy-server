@@ -16,9 +16,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-@Component
 @Slf4j
 @RequiredArgsConstructor
+@Component
 public class ProxyServerConnectionManager {
 
     private final ServerConfig serverConfig;
@@ -27,7 +27,7 @@ public class ProxyServerConnectionManager {
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
-    private ExecutorService connectionAcceptorExecutor; // For accepting the single client connection
+    private ExecutorService connectionAcceptorExecutor;
 
     @PostConstruct
     public void init() {
@@ -37,8 +37,8 @@ public class ProxyServerConnectionManager {
     }
 
     /**
-     * Listens for and accepts the single persistent connection from the client (ship proxy).
-     * This loop handles initial connection and subsequent reconnections.
+     * Listens for and accepts the single persistent connection from the proxy-client.
+     * Handles initial connection and subsequent reconnections.
      */
     private void startListeningForClient() {
         Thread.currentThread().setName("Server-Connection-Acceptor");
@@ -50,7 +50,7 @@ public class ProxyServerConnectionManager {
                 Socket clientTunnelSocket = null;
                 try {
                     log.info("Waiting for client connection on port {}...", serverConfig.getListenPort());
-                    clientTunnelSocket = serverSocket.accept(); // Blocks until a new client connects
+                    clientTunnelSocket = serverSocket.accept(); // Blocks until client connects
                     clientTunnelSocket.setTcpNoDelay(true);
                     log.info("Accepted new client tunnel connection from: {}", clientTunnelSocket.getInetAddress().getHostAddress());
 
