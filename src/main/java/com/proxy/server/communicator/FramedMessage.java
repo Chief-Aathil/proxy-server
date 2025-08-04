@@ -68,19 +68,15 @@ public class FramedMessage {
         if (messageType == MessageType.UNKNOWN) {
             throw new IOException("Unknown message type: " + typeValue);
         }
-
         long mostSigBits = dis.readLong();
         long leastSigBits = dis.readLong();
         UUID requestID = new UUID(mostSigBits, leastSigBits);
-
         int payloadLength = dis.readInt();
         if (payloadLength < 0) {
             throw new IOException("Invalid payload length: " + payloadLength);
         }
-
         byte[] payload = new byte[payloadLength];
         dis.readFully(payload);
-
         return new FramedMessage(messageType, requestID, payload);
     }
 }
