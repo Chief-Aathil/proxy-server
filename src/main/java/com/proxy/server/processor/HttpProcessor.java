@@ -31,10 +31,7 @@ public class HttpProcessor {
 
     @PostConstruct
     public void init() {
-        this.httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(Duration.ofSeconds(CONNECTION_TIMEOUT_TO_TARGET_SERVER))
-                .followRedirects(HttpClient.Redirect.NORMAL) // Follow redirects by default
+        this.httpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(CONNECTION_TIMEOUT_TO_TARGET_SERVER)).followRedirects(HttpClient.Redirect.NORMAL) // Follow redirects by default
                 .build();
         log.info("HttpProcessor initialized with HttpClient.");
     }
@@ -62,29 +59,28 @@ public class HttpProcessor {
 
             log.debug("Making actual HTTP request to: {} for ID: {}", actualHttpRequest.uri(), requestID);
             // Send actual HTTP request asynchronously and chain completion
-            return httpClient.sendAsync(actualHttpRequest, HttpResponse.BodyHandlers.ofByteArray())
-                    .handle((httpResponse, throwable) -> {
-                        try {
-                            byte[] responseBytes;
-                            if (throwable != null) {
-                                log.error("Error making actual HTTP request to {}: {}. For ID: {}", actualHttpRequest.uri(), throwable.getMessage(), requestID);
-                                responseBytes = createErrorResponse(502, "Bad Gateway", "Proxy server could not connect to target.");
-                            } else {
-                                responseBytes = buildRawHttpResponse(httpResponse);
-                                log.debug("Successfully received HTTP response from target for ID: {}", requestID);
-                            }
-                            return new FramedMessage(FramedMessage.MessageType.HTTP_RESPONSE, requestID, responseBytes);
-                        } catch (Exception e) {
-                            log.error("Critical error building proxy response for ID {}: {}", requestID, e.getMessage(), e);
-                            try {
-                                return new FramedMessage(FramedMessage.MessageType.HTTP_RESPONSE, requestID, createErrorResponse(500, "Internal Server Error", "Proxy server encountered an unexpected error."));
-                            } catch (IOException ioException) {
-                                log.error("Failed to create fallback error response for ID {}: {}", requestID, ioException.getMessage());
-                                // Fallback to a very basic error if even the error response creation fails
-                                return new FramedMessage(FramedMessage.MessageType.HTTP_RESPONSE, requestID, "HTTP/1.1 500 Internal Server Error\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
-                            }
-                        }
-                    });
+            return httpClient.sendAsync(actualHttpRequest, HttpResponse.BodyHandlers.ofByteArray()).handle((httpResponse, throwable) -> {
+                try {
+                    byte[] responseBytes;
+                    if (throwable != null) {
+                        log.error("Error making actual HTTP request to {}: {}. For ID: {}", actualHttpRequest.uri(), throwable.getMessage(), requestID);
+                        responseBytes = createErrorResponse(502, "Bad Gateway", "Proxy server could not connect to target.");
+                    } else {
+                        responseBytes = buildRawHttpResponse(httpResponse);
+                        log.debug("Successfully received HTTP response from target for ID: {}", requestID);
+                    }
+                    return new FramedMessage(FramedMessage.MessageType.HTTP_RESPONSE, requestID, responseBytes);
+                } catch (Exception e) {
+                    log.error("Critical error building proxy response for ID {}: {}", requestID, e.getMessage(), e);
+                    try {
+                        return new FramedMessage(FramedMessage.MessageType.HTTP_RESPONSE, requestID, createErrorResponse(500, "Internal Server Error", "Proxy server encountered an unexpected error."));
+                    } catch (IOException ioException) {
+                        log.error("Failed to create fallback error response for ID {}: {}", requestID, ioException.getMessage());
+                        // Fallback to a very basic error if even the error response creation fails
+                        return new FramedMessage(FramedMessage.MessageType.HTTP_RESPONSE, requestID, "HTTP/1.1 500 Internal Server Error\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                    }
+                }
+            });
         } catch (Exception e) {
             log.error("Error parsing or preparing HTTP request for ID {}: {}", requestID, e.getMessage(), e);
             try {
@@ -104,17 +100,14 @@ public class HttpProcessor {
     private String parseRawHttpRequestAndSetBuilder(byte[] rawRequestBytes, HttpRequest.Builder requestBuilder) throws IOException, java.net.URISyntaxException {
         ByteArrayInputStream bis = new ByteArrayInputStream(rawRequestBytes);
         BufferedReader reader = new BufferedReader(new InputStreamReader(bis, StandardCharsets.ISO_8859_1));
-
         String requestLine = reader.readLine();
         if (requestLine == null || requestLine.isEmpty()) {
             throw new IOException("Empty or invalid request line.");
         }
-
         Matcher requestMatcher = REQUEST_LINE_PATTERN.matcher(requestLine);
         if (!requestMatcher.matches()) {
             throw new IOException("Malformed request line: " + requestLine);
         }
-
         String method = requestMatcher.group("method");
         String pathOrAbsoluteUri = requestMatcher.group("uri");
         String line;
@@ -127,7 +120,6 @@ public class HttpProcessor {
             if (headerMatcher.matches()) {
                 String headerName = headerMatcher.group("name");
                 String headerValue = headerMatcher.group("value");
-
                 if (headerName.equalsIgnoreCase("Host")) {
                     host = headerValue;
                 } else if (headerName.equalsIgnoreCase("Content-Length")) {
@@ -140,13 +132,7 @@ public class HttpProcessor {
                     transferEncoding = headerValue;
                 }
                 // Exclude headers that proxies typically manage or remove
-                if (!headerName.equalsIgnoreCase("Host") &&
-                        !headerName.equalsIgnoreCase("Proxy-Connection") &&
-                        !headerName.equalsIgnoreCase("Connection") &&
-                        !headerName.equalsIgnoreCase("Keep-Alive") &&
-                        !headerName.equalsIgnoreCase("Proxy-Authorization") &&
-                        !headerName.equalsIgnoreCase("TE") &&
-                        !headerName.equalsIgnoreCase("Upgrade")) {
+                if (!headerName.equalsIgnoreCase("Host") && !headerName.equalsIgnoreCase("Proxy-Connection") && !headerName.equalsIgnoreCase("Connection") && !headerName.equalsIgnoreCase("Keep-Alive") && !headerName.equalsIgnoreCase("Proxy-Authorization") && !headerName.equalsIgnoreCase("TE") && !headerName.equalsIgnoreCase("Upgrade")) {
                     requestBuilder.header(headerName, headerValue);
                 }
             } else {
@@ -189,7 +175,6 @@ public class HttpProcessor {
         requestBuilder.setHeader("X-Original-Method", method); // Store method for later use in builder.method()
         requestBuilder.setHeader("X-Internal-Body-Data-Present", String.valueOf(bodyStream.toByteArray().length > 0)); // Indicate body presence
         requestBuilder.method(method, bodyStream.toByteArray().length > 0 ? HttpRequest.BodyPublishers.ofByteArray(bodyStream.toByteArray()) : HttpRequest.BodyPublishers.noBody());
-
         return method;
     }
 
@@ -204,10 +189,7 @@ public class HttpProcessor {
 
         // Headers
         httpResponse.headers().map().forEach((name, values) -> {
-            if (!name.equalsIgnoreCase("Transfer-Encoding") &&
-                    !name.equalsIgnoreCase("Connection") &&
-                    !name.equalsIgnoreCase("Keep-Alive") &&
-                    !name.equalsIgnoreCase("Content-Length")) {
+            if (!name.equalsIgnoreCase("Transfer-Encoding") && !name.equalsIgnoreCase("Connection") && !name.equalsIgnoreCase("Keep-Alive") && !name.equalsIgnoreCase("Content-Length")) {
                 values.forEach(value -> {
                     try {
                         bos.write((name + ": " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
@@ -262,15 +244,7 @@ public class HttpProcessor {
      */
     private byte[] createErrorResponse(int statusCode, String statusText, String message) throws IOException {
         String htmlBody = String.format("<html><body><h1>%d %s</h1><p>%s</p></body></html>", statusCode, statusText, message);
-        String response = String.format(
-                "HTTP/1.1 %d %s\r\n" +
-                        "Content-Type: text/html\r\n" +
-                        "Content-Length: %d\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n" +
-                        "%s",
-                statusCode, statusText, htmlBody.getBytes(StandardCharsets.ISO_8859_1).length, htmlBody
-        );
+        String response = String.format("HTTP/1.1 %d %s\r\n" + "Content-Type: text/html\r\n" + "Content-Length: %d\r\n" + "Connection: close\r\n" + "\r\n" + "%s", statusCode, statusText, htmlBody.getBytes(StandardCharsets.ISO_8859_1).length, htmlBody);
         return response.getBytes(StandardCharsets.ISO_8859_1);
     }
 }

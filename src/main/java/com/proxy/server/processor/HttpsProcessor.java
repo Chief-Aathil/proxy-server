@@ -10,7 +10,6 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
@@ -29,18 +28,18 @@ public class HttpsProcessor {
 
     public static final Pattern CONNECT_PATTERN = Pattern.compile("CONNECT\\s+([^:]+):(\\d+)");
     private final ProxyServerCommunicator serverCommunicator;
-    private final ConcurrentHashMap<UUID, Socket> activeTargetSockets = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, Socket> activeTargetSocketsMap = new ConcurrentHashMap<>();
     // Executor for handling bidirectional data transfer for each tunnel
     private final ExecutorService tunnelExecutor = Executors.newCachedThreadPool();
 
     public void handleConnectRequest(UUID requestID, byte[] connectRequestBytes) {
         String connectRequestLine = getConnectRequestLine(connectRequestBytes);
         log.info("HttpsProcessor: Received CONNECT request for ID {}: {}", requestID, connectRequestLine);
+
         // Parse host and port from the CONNECT request line
         Matcher matcher = CONNECT_PATTERN.matcher(connectRequestLine);
         if (!matcher.find()) {
             log.error("HttpsProcessor: Malformed CONNECT request for ID {}: {}", requestID, connectRequestLine);
-            // TODO: Send an error response back to the client (e.g., 500 Internal Server Error)
             return;
         }
         String targetHost = matcher.group(1);
@@ -50,17 +49,17 @@ public class HttpsProcessor {
         try {
             // Open a direct TCP socket to the target host and port
             targetSocket = new Socket(targetHost, targetPort);
-            targetSocket.setTcpNoDelay(true); // Optimization
+            targetSocket.setTcpNoDelay(true);
             log.info("HttpsProcessor: Successfully connected to target {}:{} for ID: {}", targetHost, targetPort, requestID);
 
             // Store the target socket mapping
-            activeTargetSockets.put(requestID, targetSocket);
+            activeTargetSocketsMap.put(requestID, targetSocket);
 
             // Send CONTROL_200_OK back to the client
             FramedMessage okMessage = new FramedMessage(
                     FramedMessage.MessageType.CONTROL_200_OK,
                     requestID,
-                    new byte[0] // Empty payload for 200 OK signal
+                    new byte[0]
             );
             serverCommunicator.send(okMessage);
             log.debug("HttpsProcessor: Sent CONTROL_200_OK for ID: {}", requestID);
@@ -70,17 +69,13 @@ public class HttpsProcessor {
 
         } catch (IOException e) {
             log.error("HttpsProcessor: Failed to connect to target {}:{} for ID {}: {}", targetHost, targetPort, requestID, e.getMessage());
-            // TODO: Send an error response back to the client (e.g., 502 Bad Gateway)
-            // Cleanup in case of failure
             cleanupTunnel(requestID, targetSocket);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.warn("HttpsProcessor: Interrupted while handling CONNECT request for ID {}.", requestID);
-            // Cleanup
             cleanupTunnel(requestID, targetSocket);
         } catch (Exception e) {
             log.error("HttpsProcessor: Unexpected error during CONNECT handling for ID {}: {}", requestID, e.getMessage(), e);
-            // Cleanup
             cleanupTunnel(requestID, targetSocket);
         }
     }
@@ -97,7 +92,7 @@ public class HttpsProcessor {
      * 1. Reading from the client (via ProxyServerCommunicator) and writing to the target server.
      * 2. Reading from the target server and writing to the client (via ProxyServerCommunicator).
      *
-     * @param requestID The unique ID of the tunnel.
+     * @param requestID    The unique ID of the tunnel.
      * @param targetSocket The socket connected to the target web server.
      */
     private void startBidirectionalTunnel(UUID requestID, Socket targetSocket) {
@@ -123,7 +118,7 @@ public class HttpsProcessor {
                                 requestID,
                                 payload
                         );
-                        serverCommunicator.send(dataMessage); // Send raw encrypted data from target to client
+                        serverCommunicator.send(dataMessage);
                         log.trace("HttpsProcessor: Sent {} bytes of HTTPS_DATA from target to client for ID: {}", bytesRead, requestID);
                     }
                 }
@@ -153,7 +148,7 @@ public class HttpsProcessor {
      * @param dataBytes The raw encrypted data from the client.
      */
     public void handleHttpsData(UUID requestID, byte[] dataBytes) {
-        Socket targetSocket = activeTargetSockets.get(requestID);
+        Socket targetSocket = activeTargetSocketsMap.get(requestID);
         if (targetSocket != null && !targetSocket.isClosed()) {
             try {
                 targetSocket.getOutputStream().write(dataBytes);
@@ -181,7 +176,7 @@ public class HttpsProcessor {
      */
     public void handleTunnelClose(UUID requestID) {
         log.info("HttpsProcessor: Received CONTROL_TUNNEL_CLOSE for ID: {}", requestID);
-        cleanupTunnel(requestID, activeTargetSockets.get(requestID));
+        cleanupTunnel(requestID, activeTargetSocketsMap.get(requestID));
     }
 
     /**
@@ -201,6 +196,8 @@ public class HttpsProcessor {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.error("HttpsProcessor: Failed to send CONTROL_TUNNEL_CLOSE for ID {}: {}", requestID, e.getMessage());
+        } catch (IOException e) {
+            log.error("HttpsProcessor: Failed to send CONTROL_TUNNEL_CLOSE for ID {}. Reason:{}", requestID, e.getMessage());
         }
     }
 
@@ -208,7 +205,7 @@ public class HttpsProcessor {
      * Cleans up resources associated with a specific HTTPS tunnel.
      * Closes the target socket and removes its mapping.
      *
-     * @param requestID The unique ID of the tunnel.
+     * @param requestID    The unique ID of the tunnel.
      * @param targetSocket The target socket to close (can be null).
      */
     private void cleanupTunnel(UUID requestID, Socket targetSocket) {
@@ -222,14 +219,14 @@ public class HttpsProcessor {
                 log.error("HttpsProcessor: Error closing target socket for ID {}: {}", requestID, e.getMessage());
             }
         }
-        activeTargetSockets.remove(requestID);
+        activeTargetSocketsMap.remove(requestID);
         log.debug("HttpsProcessor: Removed target socket mapping for ID: {}", requestID);
     }
 
     @PreDestroy
     public void shutdown() {
         log.info("HttpsProcessor: Shutting down. Closing all active target sockets.");
-        activeTargetSockets.forEach((id, socket) -> {
+        activeTargetSocketsMap.forEach((id, socket) -> {
             try {
                 if (!socket.isClosed()) {
                     socket.close();
@@ -238,7 +235,7 @@ public class HttpsProcessor {
                 log.error("HttpsProcessor: Error closing target socket {} during shutdown: {}", id, e.getMessage());
             }
         });
-        activeTargetSockets.clear();
+        activeTargetSocketsMap.clear();
 
         if (tunnelExecutor != null) {
             tunnelExecutor.shutdown();
