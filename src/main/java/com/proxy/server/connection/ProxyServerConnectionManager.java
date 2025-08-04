@@ -1,118 +1,160 @@
 package com.proxy.server.connection;
 
 import com.proxy.server.communicator.ProxyServerCommunicator;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
-
+import com.proxy.server.config.ServerConfig;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
 @Slf4j
 @RequiredArgsConstructor
 public class ProxyServerConnectionManager {
 
-    @Value("${proxy.server.listen.port}")
-    private int listenPort;
+    private final ServerConfig serverConfig;
+    private final ProxyServerCommunicator serverCommunicator;
+    private final AtomicBoolean isClientConnectionLost = new AtomicBoolean(false);
 
     private ServerSocket serverSocket;
-    private Socket clientTunnelSocket; // The single persistent tunnel socket
-    private final ProxyServerCommunicator proxyServerCommunicator;
-    private ExecutorService serverListenerExecutor;
-    private Future<?> listenerTask;
+    private volatile boolean running = false;
+    private ExecutorService connectionAcceptorExecutor; // For accepting the single client connection
 
-
-    /**
-     * Initializes the server socket and starts listening for the client tunnel connection.
-     */
     @PostConstruct
     public void init() {
-        serverListenerExecutor = Executors.newSingleThreadExecutor();
-        listenerTask = serverListenerExecutor.submit(this::startListening);
+        running = true;
+        connectionAcceptorExecutor = Executors.newSingleThreadExecutor();
+        connectionAcceptorExecutor.submit(this::startListeningForClient);
     }
 
     /**
-     * Starts listening for the single client tunnel connection.
+     * Listens for and accepts the single persistent connection from the client (ship proxy).
+     * This loop handles initial connection and subsequent reconnections.
      */
-    private void startListening() {
+    private void startListeningForClient() {
+        Thread.currentThread().setName("Server-Connection-Acceptor");
+        log.info("ProxyServerConnectionManager started, listening for client on port {}", serverConfig.getListenPort());
+
         try {
-            serverSocket = new ServerSocket(listenPort);
-            log.info("Proxy Server listening for client tunnel on port {}", listenPort);
-
-            // As per requirement constraint, we accept only one client tunnel connection.
-            clientTunnelSocket = serverSocket.accept();
-            clientTunnelSocket.setTcpNoDelay(true); // Optimize for lower latency
-            log.info("Client tunnel connected from: {}", clientTunnelSocket.getInetAddress().getHostAddress());
-
-            // Initialize the communicator with the socket's streams
-            proxyServerCommunicator.initialize(clientTunnelSocket.getInputStream(), clientTunnelSocket.getOutputStream());
-
-            // Start communicator's send and receive threads
-            proxyServerCommunicator.start();
-
-        } catch (IOException e) {
-            log.error("Error starting or accepting connection on Proxy Server: {}", e.getMessage());
-            // This could be due to port in use, or other network issues.
-            // For now, we log and exit/stop. Reconnect logic will be in later phases.
-        } finally {
-            // Ensure server socket is closed if an error occurs before it's managed by PreDestroy
-            if (serverSocket != null && !serverSocket.isClosed()) {
+            serverSocket = new ServerSocket(serverConfig.getListenPort());
+            while (running) {
+                Socket clientTunnelSocket = null;
                 try {
-                    serverSocket.close();
+                    log.info("Waiting for client connection on port {}...", serverConfig.getListenPort());
+                    clientTunnelSocket = serverSocket.accept(); // Blocks until a new client connects
+                    clientTunnelSocket.setTcpNoDelay(true);
+                    log.info("Accepted new client tunnel connection from: {}", clientTunnelSocket.getInetAddress().getHostAddress());
+
+                    // If there was an old communicator, shut it down gracefully
+                    if (serverCommunicator.isRunning()) {
+                        log.warn("New client connection received while old communicator was still running. Shutting down old communicator.");
+                        serverCommunicator.shutdown();
+                    }
+                    serverCommunicator.initialize(clientTunnelSocket, this::onClientConnectionLoss);
+                    serverCommunicator.start();
+                    isClientConnectionLost.set(false); // Reset signal on successful connection
+
+                    // Periodically check status
+                    while (running && serverCommunicator.isRunning() && !isClientConnectionLost.get()) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            log.warn("Server connection acceptor interrupted while waiting for communicator status.");
+                            break;
+                        }
+                    }
+                    log.info("Client communicator stopped. Preparing to accept new connection if running.");
+
                 } catch (IOException e) {
-                    log.error("Error closing server socket: {}", e.getMessage());
+                    if (running) { // Only log error if not intentionally shutting down
+                        log.error("Error accepting client tunnel connection: {}", e.getMessage());
+                    } else {
+                        log.info("ProxyServerConnectionManager stopped accepting connections.");
+                    }
+                } catch (Exception e) {
+                    log.error("Unexpected error in server connection acceptor loop: {}", e.getMessage(), e);
+                } finally {
+                    // Ensure the socket is closed if an error occurred before communicator took over
+                    if (clientTunnelSocket != null && !clientTunnelSocket.isClosed()) {
+                        try {
+                            clientTunnelSocket.close();
+                            log.debug("Closed client tunnel socket after handling or error.");
+                        } catch (IOException e) {
+                            log.error("Error closing client tunnel socket: {}", e.getMessage());
+                        }
+                    }
+                    // If the communicator stopped due to connection loss, the loop will continue to accept a new one
                 }
             }
+        } catch (IOException e) {
+            log.error("Could not start ProxyServerConnectionManager on port {}: {}", serverConfig.getListenPort(), e.getMessage());
+            running = false; // Mark as not running if startup fails
+        } finally {
+            cleanupServerSocket();
+            log.info("ProxyServerConnectionManager stopped.");
         }
     }
 
     /**
-     * Closes the server socket and client tunnel socket gracefully when the application shuts down.
+     * Callback method invoked by ProxyServerCommunicator when connection to client is lost.
      */
+    private void onClientConnectionLoss() {
+        log.warn("Connection to client (ship proxy) lost. Signalling for new connection acceptance.");
+        isClientConnectionLost.set(true);
+        // This will make the startListeningForClient() to accept new connection with client.
+    }
+
+    /**
+     * Cleans up the server socket.
+     */
+    private void cleanupServerSocket() {
+        if (serverSocket != null && !serverSocket.isClosed()) {
+            try {
+                serverSocket.close();
+                log.info("Closed server socket.");
+            } catch (IOException e) {
+                log.error("Error closing server socket: {}", e.getMessage());
+            }
+        }
+    }
+
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down ProxyServerConnectionManager.");
-        if (listenerTask != null) {
-            listenerTask.cancel(true); // Interrupt the listening task
-        }
-        if (serverListenerExecutor != null) {
-            serverListenerExecutor.shutdownNow(); // Force shutdown of executor
-        }
+        running = false;
 
-        try {
-            if (clientTunnelSocket != null && !clientTunnelSocket.isClosed()) {
-                clientTunnelSocket.close();
-                log.info("Closed client tunnel socket.");
+        // Shut down the connection acceptor executor gracefully
+        if (connectionAcceptorExecutor != null) {
+            connectionAcceptorExecutor.shutdown();
+            try {
+                if (!connectionAcceptorExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    log.warn("Connection acceptor executor did not terminate in time, forcing shutdown.");
+                    connectionAcceptorExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Connection acceptor executor shutdown interrupted.");
+                connectionAcceptorExecutor.shutdownNow();
             }
-        } catch (IOException e) {
-            log.error("Error closing client tunnel socket: {}", e.getMessage());
         }
 
-        try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
-                log.info("Closed server socket.");
-            }
-        } catch (IOException e) {
-            log.error("Error closing server socket: {}", e.getMessage());
-        } finally {
-            proxyServerCommunicator.shutdown(); // Ensure communicator resources are also released
-        }
-    }
+        // Ensure the server socket is closed to unblock accept()
+        cleanupServerSocket();
 
-    /**
-     * Check if the client tunnel connection is currently active.
-     * @return true if connected, false otherwise.
-     */
-    public boolean isClientTunnelConnected() {
-        return clientTunnelSocket != null && clientTunnelSocket.isConnected() && !clientTunnelSocket.isClosed();
+        // Shut down communicator and its own threads and processors
+        if (serverCommunicator.isRunning()) {
+            serverCommunicator.shutdown();
+        }
+        log.info("ProxyServerConnectionManager shutdown complete.");
     }
 }
