@@ -1,48 +1,39 @@
 package com.proxy.server.processor;
 
-import com.proxy.server.communicator.FramedMessage; // Using FramedMessage from client module
+import com.proxy.server.communicator.FramedMessage;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
-import jakarta.annotation.PostConstruct;
-
-import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-@Component
 @Slf4j
 @RequiredArgsConstructor
+@Component
 public class HttpProcessor {
 
-    private HttpClient httpClient;
-
-    // Regex patterns for parsing HTTP request line and headers
+    public static final int CONNECTION_TIMEOUT_TO_TARGET_SERVER = 10;
     private static final Pattern REQUEST_LINE_PATTERN = Pattern.compile("(?<method>[A-Z]+)\\s+(?<uri>[^\\s]+)\\s+HTTP/1\\.(?<minor>0|1)");
     private static final Pattern HEADER_PATTERN = Pattern.compile("(?<name>[^:]+):\\s*(?<value>.*)");
+
+    private HttpClient httpClient;
 
     @PostConstruct
     public void init() {
         this.httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1) // Use HTTP/1.1
-                .connectTimeout(Duration.ofSeconds(10)) // Connection timeout to target server
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(CONNECTION_TIMEOUT_TO_TARGET_SERVER))
                 .followRedirects(HttpClient.Redirect.NORMAL) // Follow redirects by default
                 .build();
         log.info("HttpProcessor initialized with HttpClient.");
@@ -62,7 +53,7 @@ public class HttpProcessor {
         log.info("HttpProcessor received HTTP_REQUEST for ID: {}", requestID);
 
         try {
-            // 1. Parse the raw HTTP request bytes
+            // Parse the raw HTTP request bytes
             HttpRequest.Builder requestBuilder = HttpRequest.newBuilder();
             String method = parseRawHttpRequestAndSetBuilder(rawRequestPayload, requestBuilder);
 
@@ -70,7 +61,6 @@ public class HttpProcessor {
             HttpRequest actualHttpRequest = requestBuilder.method(method, requestBuilder.build().bodyPublisher().orElse(HttpRequest.BodyPublishers.noBody())).build();
 
             log.debug("Making actual HTTP request to: {} for ID: {}", actualHttpRequest.uri(), requestID);
-
             // Send actual HTTP request asynchronously and chain completion
             return httpClient.sendAsync(actualHttpRequest, HttpResponse.BodyHandlers.ofByteArray())
                     .handle((httpResponse, throwable) -> {
@@ -95,7 +85,6 @@ public class HttpProcessor {
                             }
                         }
                     });
-
         } catch (Exception e) {
             log.error("Error parsing or preparing HTTP request for ID {}: {}", requestID, e.getMessage(), e);
             try {
@@ -128,7 +117,6 @@ public class HttpProcessor {
 
         String method = requestMatcher.group("method");
         String pathOrAbsoluteUri = requestMatcher.group("uri");
-
         String line;
         String host = null;
         int contentLength = 0;
@@ -195,8 +183,6 @@ public class HttpProcessor {
                 log.warn("Incomplete body read. Expected {} bytes, read {}.", contentLength, totalBytesRead);
             }
         } else if ("chunked".equalsIgnoreCase(transferEncoding)) {
-            // TODO: For chunked encoding, we would need to parse and read chunks.
-            // For now, we'll log a warning and treat it as no body.
             log.warn("Chunked transfer encoding is not fully supported in this phase for request. Body will be empty.");
         }
         // Set the body publisher directly on the builder
@@ -204,7 +190,7 @@ public class HttpProcessor {
         requestBuilder.setHeader("X-Internal-Body-Data-Present", String.valueOf(bodyStream.toByteArray().length > 0)); // Indicate body presence
         requestBuilder.method(method, bodyStream.toByteArray().length > 0 ? HttpRequest.BodyPublishers.ofByteArray(bodyStream.toByteArray()) : HttpRequest.BodyPublishers.noBody());
 
-        return method; // Return the method
+        return method;
     }
 
     /**
@@ -219,9 +205,9 @@ public class HttpProcessor {
         // Headers
         httpResponse.headers().map().forEach((name, values) -> {
             if (!name.equalsIgnoreCase("Transfer-Encoding") &&
-                !name.equalsIgnoreCase("Connection") &&
-                !name.equalsIgnoreCase("Keep-Alive") &&
-                !name.equalsIgnoreCase("Content-Length")) {  
+                    !name.equalsIgnoreCase("Connection") &&
+                    !name.equalsIgnoreCase("Keep-Alive") &&
+                    !name.equalsIgnoreCase("Content-Length")) {
                 values.forEach(value -> {
                     try {
                         bos.write((name + ": " + value + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
@@ -244,7 +230,6 @@ public class HttpProcessor {
         if (body != null && body.length > 0) {
             bos.write(body);
         }
-
         return bos.toByteArray();
     }
 
